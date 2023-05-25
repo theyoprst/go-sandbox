@@ -134,11 +134,6 @@ func (td *Cmd) buildReport(result printers.JSONResult) report {
 		}
 	}
 	for _, lintersSet := range lintersPerPosition {
-		var linters []FullName
-		for n := range lintersSet {
-			linters = append(linters, n)
-		}
-		// log.Printf("%s: %s", pos, linters)
 		for fullName1 := range lintersSet {
 			for fullName2 := range lintersSet {
 				if fullName1 != fullName2 {
