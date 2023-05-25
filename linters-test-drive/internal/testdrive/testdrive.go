@@ -2,16 +2,19 @@ package testdrive
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"go/token"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
 	"strings"
+	"text/template"
 
 	"github.com/golangci/golangci-lint/pkg/lint/linter"
 	"github.com/golangci/golangci-lint/pkg/lint/lintersdb"
@@ -72,7 +75,11 @@ func (td *Cmd) Execute(_ context.Context, _ *flag.FlagSet, _ ...any) subcommands
 		return subcommands.ExitFailure
 	}
 	report := td.buildReport(jsonResult, linterToSection)
-	td.printReport(report)
+	// td.printReport(report)
+	if err := td.renderReport(report); err != nil {
+		log.Printf("Error rendering report: %v", err)
+		return subcommands.ExitFailure
+	}
 	return subcommands.ExitSuccess
 }
 
@@ -91,9 +98,10 @@ func (td *Cmd) callGolangcilint() (printers.JSONResult, error) {
 	return jsonResult, nil
 }
 
-type report struct {
+type Report struct {
 	TotalIssuesCount int
 	Sections         map[string][]linterReport
+	SectionsOrder    []string
 }
 
 type FullName struct {
@@ -110,22 +118,28 @@ func (fn FullName) String() string {
 
 type linterReport struct {
 	Name       string
+	FullName   FullName
 	Issues     []result.Issue
 	SubLinters []linterReport
-	Intersects []linterShare
+	Intersects []LinterShare
 
 	subLintersMap  map[string]*linterReport
 	intersectCount map[FullName]int
 }
 
-type linterShare struct {
-	name  FullName
-	share float64
+type LinterShare struct {
+	Name  FullName
+	Share float64
 }
 
-func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[string]string) report {
-	r := report{
-		Sections: map[string][]linterReport{},
+func (s LinterShare) Percent() int {
+	return int(math.Round(s.Share * 100.0))
+}
+
+func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[string]string) Report {
+	r := Report{
+		Sections:      map[string][]linterReport{},
+		SectionsOrder: sectionsOrder,
 	}
 	linterInfos := make(map[string]*linterReport)
 	allLinterInfos := make(map[FullName]*linterReport) // including sublinters
@@ -146,6 +160,7 @@ func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[strin
 		if linterInfos[name] == nil {
 			linterInfos[name] = &linterReport{
 				Name:           name,
+				FullName:       FullName{name: name},
 				subLintersMap:  make(map[string]*linterReport),
 				intersectCount: make(map[FullName]int),
 			}
@@ -157,6 +172,7 @@ func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[strin
 			if linterInfo.subLintersMap[subName] == nil {
 				linterInfo.subLintersMap[subName] = &linterReport{
 					Name:           subName,
+					FullName:       fullName,
 					intersectCount: make(map[FullName]int),
 				}
 			}
@@ -177,14 +193,15 @@ func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[strin
 	for _, linterInfo := range allLinterInfos {
 		n := len(linterInfo.Issues)
 		for fullName, count := range linterInfo.intersectCount {
-			linterInfo.Intersects = append(linterInfo.Intersects, linterShare{
-				name:  fullName,
-				share: float64(count) / float64(n),
+			linterInfo.Intersects = append(linterInfo.Intersects, LinterShare{
+				Name:  fullName,
+				Share: float64(count) / float64(n),
 			})
 		}
 		sort.Slice(linterInfo.Intersects, func(i, j int) bool {
-			return linterInfo.Intersects[i].share > linterInfo.Intersects[j].share
+			return linterInfo.Intersects[i].Share > linterInfo.Intersects[j].Share
 		})
+		linterInfo.Intersects = filterIntersections(linterInfo.Intersects, 0.5)
 	}
 	for _, linterInfo := range linterInfos {
 		section := linterToSection[linterInfo.Name]
@@ -204,13 +221,20 @@ func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[strin
 	return r
 }
 
-func formatIntersections(linters []linterShare, shareThreshold float64) string {
+func filterIntersections(linters []LinterShare, shareThreshold float64) []LinterShare {
 	i := 0
-	for ; i < len(linters) && linters[i].share > shareThreshold; i++ {
+	for ; i < len(linters) && linters[i].Share > shareThreshold; i++ {
+	}
+	return linters[:i]
+}
+
+func formatIntersections(linters []LinterShare, shareThreshold float64) string {
+	i := 0
+	for ; i < len(linters) && linters[i].Share > shareThreshold; i++ {
 	}
 	var parts []string
 	for j := 0; j < i; j++ {
-		parts = append(parts, fmt.Sprintf("%s (%0.0f%%)", linters[j].name, 100*linters[j].share))
+		parts = append(parts, fmt.Sprintf("%s (%0.0f%%)", linters[j].Name, 100*linters[j].Share))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -218,7 +242,21 @@ func formatIntersections(linters []linterShare, shareThreshold float64) string {
 	return "; intersects with " + strings.Join(parts, ", ")
 }
 
-func (td *Cmd) printReport(r report) {
+//go:embed report-template.md
+var reportTemplate string
+
+func (td *Cmd) renderReport(r Report) error {
+	tmpl, err := template.New("template").Funcs(template.FuncMap{
+		"underLinePointer": UnderLinePointer,
+		"formatText":       FormatText,
+	}).Parse(reportTemplate)
+	if err != nil {
+		return err
+	}
+	return tmpl.Execute(os.Stdout, r)
+}
+
+func (td *Cmd) printReport(r Report) {
 	const intersectionThreshold = 0.5
 	log.Printf("There are %d issues found", r.TotalIssuesCount)
 	for _, section := range sectionsOrder {
@@ -230,8 +268,66 @@ func (td *Cmd) printReport(r report) {
 				log.Printf("    * %s: %d issues%s",
 					subLinter.Name, len(subLinter.Issues), formatIntersections(subLinter.Intersects, intersectionThreshold))
 			}
+			for _, issue := range linter.Issues {
+				_ = issue
+				// issue.SourceLines
+			}
 		}
 	}
+}
+
+func trimLeftCommonSpaces(issue *result.Issue) {
+	if len(issue.SourceLines) == 0 {
+		return
+	}
+	for {
+		if len(issue.SourceLines[0]) == 0 {
+			break
+		}
+		first := issue.SourceLines[0][0]
+		if first != ' ' && first != '\t' {
+			break
+		}
+		isCommon := true
+		for i := 1; i < len(issue.SourceLines); i++ {
+			if len(issue.SourceLines[i]) == 0 || issue.SourceLines[i][0] != first {
+				isCommon = false
+				break
+			}
+		}
+		if !isCommon {
+			break
+		}
+		for i := range issue.SourceLines {
+			issue.SourceLines[i] = issue.SourceLines[i][1:]
+		}
+		issue.Pos.Column--
+	}
+}
+
+func FormatText(i *result.Issue) string {
+	trimLeftCommonSpaces(i)
+	return strings.Join(append(i.SourceLines, UnderLinePointer(i)), "\n")
+}
+
+func UnderLinePointer(i *result.Issue) string {
+	// if column == 0 it means column is unknown (e.g. for gosec)
+	if len(i.SourceLines) != 1 || i.Pos.Column == 0 {
+		return ""
+	}
+
+	col0 := i.Pos.Column - 1
+	line := i.SourceLines[0]
+	prefixRunes := make([]rune, 0, len(line))
+	for j := 0; j < len(line) && j < col0; j++ {
+		if line[j] == '\t' {
+			prefixRunes = append(prefixRunes, '\t')
+		} else {
+			prefixRunes = append(prefixRunes, ' ')
+		}
+	}
+
+	return string(prefixRunes) + "^"
 }
 
 var subLinterRe = regexp.MustCompile(`^([\w-]+(\([\w\s-]+\))?):`)
