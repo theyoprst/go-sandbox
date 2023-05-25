@@ -13,9 +13,12 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/golangci/golangci-lint/pkg/lint/linter"
+	"github.com/golangci/golangci-lint/pkg/lint/lintersdb"
 	"github.com/golangci/golangci-lint/pkg/printers"
 	"github.com/golangci/golangci-lint/pkg/result"
 	"github.com/google/subcommands"
+	"golang.org/x/exp/slices"
 )
 
 type Cmd struct {
@@ -38,13 +41,37 @@ func (td *Cmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&td.sourcesPath, "sources-path", "", "path to go sources")
 }
 
+var sectionsOrder = []string{
+	"default", "bugs", "unused", "format", "complexity", "performance", "test", "comment", "style", "other",
+}
+
+func Section(lntr *linter.Config) string {
+	if lntr.EnabledByDefault {
+		return "default"
+	}
+	for _, section := range sectionsOrder {
+		if slices.Contains(lntr.InPresets, section) {
+			return section
+		}
+	}
+	return "other"
+}
+
 func (td *Cmd) Execute(_ context.Context, _ *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+	allLinters := lintersdb.NewManager(nil, nil).GetAllSupportedLinterConfigs()
+	linterToSection := map[string]string{}
+	for _, linter := range allLinters {
+		if linter.Deprecation != nil {
+			continue
+		}
+		linterToSection[linter.Name()] = Section(linter)
+	}
 	jsonResult, err := td.callGolangcilint()
 	if err != nil {
 		log.Printf("`golangci-lint run` call error %s", err)
 		return subcommands.ExitFailure
 	}
-	report := td.buildReport(jsonResult)
+	report := td.buildReport(jsonResult, linterToSection)
 	td.printReport(report)
 	return subcommands.ExitSuccess
 }
@@ -66,7 +93,7 @@ func (td *Cmd) callGolangcilint() (printers.JSONResult, error) {
 
 type report struct {
 	TotalIssuesCount int
-	Linters          []linterReport
+	Sections         map[string][]linterReport
 }
 
 type FullName struct {
@@ -96,15 +123,20 @@ type linterShare struct {
 	share float64
 }
 
-func (td *Cmd) buildReport(result printers.JSONResult) report {
+func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[string]string) report {
 	r := report{
-		TotalIssuesCount: len(result.Issues),
+		Sections: map[string][]linterReport{},
 	}
 	linterInfos := make(map[string]*linterReport)
 	allLinterInfos := make(map[FullName]*linterReport) // including sublinters
 	lintersPerPosition := make(map[token.Position]map[FullName]struct{})
 	for _, issue := range result.Issues {
 		name := issue.FromLinter
+		if linterToSection[name] == "" {
+			// Skip deprecated linters
+			continue
+		}
+		r.TotalIssuesCount++
 		subName := parseSubLinter(issue.Text)
 		if lintersPerPosition[issue.Pos] == nil {
 			lintersPerPosition[issue.Pos] = make(map[FullName]struct{})
@@ -155,17 +187,20 @@ func (td *Cmd) buildReport(result printers.JSONResult) report {
 		})
 	}
 	for _, linterInfo := range linterInfos {
+		section := linterToSection[linterInfo.Name]
 		for _, subLinterInfo := range linterInfo.subLintersMap {
 			linterInfo.SubLinters = append(linterInfo.SubLinters, *subLinterInfo)
 		}
 		sort.Slice(linterInfo.SubLinters, func(i, j int) bool {
 			return linterInfo.SubLinters[i].Name < linterInfo.SubLinters[j].Name
 		})
-		r.Linters = append(r.Linters, *linterInfo)
+		r.Sections[section] = append(r.Sections[section], *linterInfo)
 	}
-	sort.Slice(r.Linters, func(i, j int) bool {
-		return r.Linters[i].Name < r.Linters[j].Name
-	})
+	for section := range r.Sections {
+		sort.Slice(r.Sections[section], func(i, j int) bool {
+			return r.Sections[section][i].Name < r.Sections[section][j].Name
+		})
+	}
 	return r
 }
 
@@ -186,12 +221,15 @@ func formatIntersections(linters []linterShare, shareThreshold float64) string {
 func (td *Cmd) printReport(r report) {
 	const intersectionThreshold = 0.5
 	log.Printf("There are %d issues found", r.TotalIssuesCount)
-	for _, linter := range r.Linters {
-		log.Printf("  * %s: %d issues%s",
-			linter.Name, len(linter.Issues), formatIntersections(linter.Intersects, intersectionThreshold))
-		for _, subLinter := range linter.SubLinters {
-			log.Printf("    * %s: %d issues%s",
-				subLinter.Name, len(subLinter.Issues), formatIntersections(subLinter.Intersects, intersectionThreshold))
+	for _, section := range sectionsOrder {
+		log.Printf("=== Section %s ===", section)
+		for _, linter := range r.Sections[section] {
+			log.Printf("  * %s: %d issues%s",
+				linter.Name, len(linter.Issues), formatIntersections(linter.Intersects, intersectionThreshold))
+			for _, subLinter := range linter.SubLinters {
+				log.Printf("    * %s: %d issues%s",
+					subLinter.Name, len(subLinter.Issues), formatIntersections(subLinter.Intersects, intersectionThreshold))
+			}
 		}
 	}
 }
