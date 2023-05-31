@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -22,6 +23,9 @@ import (
 	"github.com/golangci/golangci-lint/pkg/result"
 	"github.com/google/subcommands"
 	"golang.org/x/exp/slices"
+	"golang.org/x/mod/modfile"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 type Cmd struct {
@@ -33,11 +37,11 @@ func (*Cmd) Name() string {
 }
 
 func (*Cmd) Synopsis() string {
-	return "run golangci-lint with all the linters and build a report"
+	return "runs golangci-lint with all the linters and build a report"
 }
 
 func (*Cmd) Usage() string {
-	return `linters-test-drive`
+	return `linters-test-drive run`
 }
 
 func (td *Cmd) SetFlags(f *flag.FlagSet) {
@@ -76,11 +80,24 @@ func (td *Cmd) Execute(_ context.Context, _ *flag.FlagSet, _ ...any) subcommands
 	}
 	report := td.buildReport(jsonResult, linterToSection)
 	// td.printReport(report)
+	modulePath, err := td.modulePath()
+	if err != nil {
+		log.Printf("Error getting module path: %v", err)
+	}
+	report.ModulePath = modulePath
 	if err := td.renderReport(report); err != nil {
 		log.Printf("Error rendering report: %v", err)
 		return subcommands.ExitFailure
 	}
 	return subcommands.ExitSuccess
+}
+
+func (td *Cmd) modulePath() (string, error) {
+	data, err := os.ReadFile(path.Join(td.sourcesPath, "go.mod"))
+	if err != nil {
+		return "", err
+	}
+	return modfile.ModulePath(data), nil
 }
 
 func (td *Cmd) callGolangcilint() (printers.JSONResult, error) {
@@ -102,6 +119,7 @@ type Report struct {
 	TotalIssuesCount int
 	Sections         map[string][]linterReport
 	SectionsOrder    []string
+	ModulePath       string
 }
 
 type FullName struct {
@@ -144,7 +162,7 @@ func (td *Cmd) buildReport(result printers.JSONResult, linterToSection map[strin
 	linterInfos := make(map[string]*linterReport)
 	allLinterInfos := make(map[FullName]*linterReport) // including sublinters
 	lintersPerPosition := make(map[token.Position]map[FullName]struct{})
-	for _, issue := range result.Issues {
+	for _, issue := range result.Issues[:500] {
 		name := issue.FromLinter
 		if linterToSection[name] == "" {
 			// Skip deprecated linters
@@ -247,33 +265,16 @@ var reportTemplate string
 
 func (td *Cmd) renderReport(r Report) error {
 	tmpl, err := template.New("template").Funcs(template.FuncMap{
-		"underLinePointer": UnderLinePointer,
-		"formatText":       FormatText,
+		"formatText": FormatText,
+		"getLink": func(issue *result.Issue) string {
+			return GetLink(issue, r.ModulePath)
+		},
+		"title": cases.Title(language.Und).String,
 	}).Parse(reportTemplate)
 	if err != nil {
 		return err
 	}
 	return tmpl.Execute(os.Stdout, r)
-}
-
-func (td *Cmd) printReport(r Report) {
-	const intersectionThreshold = 0.5
-	log.Printf("There are %d issues found", r.TotalIssuesCount)
-	for _, section := range sectionsOrder {
-		log.Printf("=== Section %s ===", section)
-		for _, linter := range r.Sections[section] {
-			log.Printf("  * %s: %d issues%s",
-				linter.Name, len(linter.Issues), formatIntersections(linter.Intersects, intersectionThreshold))
-			for _, subLinter := range linter.SubLinters {
-				log.Printf("    * %s: %d issues%s",
-					subLinter.Name, len(subLinter.Issues), formatIntersections(subLinter.Intersects, intersectionThreshold))
-			}
-			for _, issue := range linter.Issues {
-				_ = issue
-				// issue.SourceLines
-			}
-		}
-	}
 }
 
 func trimLeftCommonSpaces(issue *result.Issue) {
@@ -328,6 +329,11 @@ func UnderLinePointer(i *result.Issue) string {
 	}
 
 	return string(prefixRunes) + "^"
+}
+
+func GetLink(issue *result.Issue, modulePath string) string {
+	return fmt.Sprintf("https://%s/blob/master/%s#L%d",
+		modulePath, issue.FilePath(), issue.Line())
 }
 
 var subLinterRe = regexp.MustCompile(`^([\w-]+(\([\w\s-]+\))?):`)

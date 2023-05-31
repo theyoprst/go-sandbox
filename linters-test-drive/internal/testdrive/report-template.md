@@ -5,22 +5,22 @@
 {{ end -}}
 {{ define "issues" }}
     {{- range .Issues}}
-{{ .FilePath }}:{{ .Line }}{{ if .Pos.Column }}:{{ .Pos.Column }}{{ end }}: {{ .Text }}
+[{{ .FilePath }}:{{ .Line }}]({{ getLink . }}){{ if .Pos.Column }}:{{ .Pos.Column }}{{ end }}: {{ .Text }}
 ```
 {{ formatText . }}
 ```
     {{end}}
 {{ end -}}
 
-There are {{ .TotalIssuesCount }} issues found.
+There are {{ .TotalIssuesCount }} issues found in {{ .ModulePath }}.
 {{ range .SectionsOrder }}
-### {{ . }} Linters
+# {{ . | title }} Linters
     {{- range index $.Sections .}}
-#### {{ .Name }}: {{ .Issues | len }} issues
+## {{ .Name }}: {{ .Issues | len }} issues
 {{ template "intersects" .}}
 {{ if not .SubLinters }}{{ template "issues" .}}{{ end }}
         {{- range .SubLinters }}
-##### {{ .FullName }}: {{ .Issues | len }} issues
+### {{ .FullName }}: {{ .Issues | len }} issues
 {{ template "intersects" .}}
 {{ template "issues" .}}
         {{- end }}
